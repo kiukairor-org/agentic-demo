@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -49,6 +50,34 @@ func TestVersion(t *testing.T) {
 	}
 	if len(body) != 2 || body["app"] != "demo" || body["version"] != "abc123" {
 		t.Fatalf("got %v", body)
+	}
+}
+
+func TestEcho(t *testing.T) {
+	rec, body := get(t, "/echo?msg=hello")
+	if rec.Code != http.StatusOK || body["echo"] != "hello" {
+		t.Fatalf("got %d %v", rec.Code, body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type %q", ct)
+	}
+}
+
+func TestEchoSpecialChars(t *testing.T) {
+	const msg = `a b&c=d/é "<x>" +%`
+	rec, body := get(t, "/echo?msg="+url.QueryEscape(msg))
+	if rec.Code != http.StatusOK || body["echo"] != msg {
+		t.Fatalf("got %d %v", rec.Code, body)
+	}
+}
+
+func TestEchoMissingMsg(t *testing.T) {
+	rec, _ := get(t, "/echo")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type %q", ct)
 	}
 }
 

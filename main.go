@@ -30,6 +30,14 @@ func newMux() *http.ServeMux {
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"app": appName(), "version": version})
 	})
+	mux.HandleFunc("GET /echo", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if !q.Has("msg") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing msg parameter"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"echo": q.Get("msg")})
+	})
 	return mux
 }
 
