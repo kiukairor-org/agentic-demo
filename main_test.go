@@ -35,6 +35,23 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestVersion(t *testing.T) {
+	t.Setenv("APP_NAME", "demo")
+	old := version
+	version = "abc123"
+	defer func() { version = old }()
+	rec, body := get(t, "/version")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type %q", ct)
+	}
+	if len(body) != 2 || body["app"] != "demo" || body["version"] != "abc123" {
+		t.Fatalf("got %v", body)
+	}
+}
+
 func TestUnknownPath(t *testing.T) {
 	if rec, _ := get(t, "/nope"); rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d", rec.Code)
