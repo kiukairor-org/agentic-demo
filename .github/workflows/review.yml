@@ -62,15 +62,29 @@ jobs:
           MAX_CHANGED_LINES: ${{ vars.REVIEW_MAX_CHANGED_LINES || '400' }}
         run: bash .github/scripts/review-gate.sh
 
+      # Disabling auto-merge needs Contents write (like hold.yml); mint it only when escalating,
+      # so the token used around the Claude step keeps issues/PRs write only. DECISIONS D37.
+      - id: esc
+        if: steps.gate.outputs.escalate == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.KIU_HOMIE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.KIU_HOMIE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
       - name: escalate to a human
         if: steps.gate.outputs.escalate == 'true'
         env:
-          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          GH_TOKEN: ${{ steps.esc.outputs.token }}
           PR: ${{ steps.pr.outputs.number }}
           REASON: ${{ steps.gate.outputs.reason }}
         run: |
           gh pr edit "$PR" --add-label needs-human
-          gh pr merge "$PR" --disable-auto 2>/dev/null || true
+          # fail loudly if auto-merge can't be disabled, but don't fail when it was never enabled
+          if [ "$(gh pr view "$PR" --json autoMergeRequest --jq '.autoMergeRequest != null')" = true ]; then
+            gh pr merge "$PR" --disable-auto
+          fi
           printf 'Not auto-reviewed — escalated to a human:\n%s\n' "$REASON" > body.md
           gh pr comment "$PR" --body-file body.md
 
