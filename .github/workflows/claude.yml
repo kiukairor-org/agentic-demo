@@ -40,7 +40,22 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: {go-version-file: go.mod}
+      # Owner's Claude budget gate (D62): ok -> run; paused/limit -> skip with a comment (the catcher
+      # re-triggers it when the budget is resumed).
+      - id: budget
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: .github/scripts/budget-state.sh
+      - name: budget gate - skip Claude
+        if: steps.budget.outputs.state != 'ok'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          NUM: ${{ github.event.issue.number }}
+          STATE: ${{ steps.budget.outputs.state }}
+        run: |
+          printf '⏸️ Agent run skipped: the owner'"'"'s Claude usage gate is **%s**. It runs again automatically when usage is resumed.\n<!-- homie-budget-skipped -->\n' "$STATE" > skip.md
+          gh issue comment "$NUM" -R "$GITHUB_REPOSITORY" --body-file skip.md
       - id: claude
+        if: steps.budget.outputs.state == 'ok'
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1.0.251
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -55,10 +70,20 @@ jobs:
             --allowedTools "Edit,Write,Read,Glob,Grep,Bash(go build:*),Bash(go test:*),Bash(go vet:*),Bash(gofmt:*),Bash(go mod tidy),Bash(kubectl kustomize:*),Bash(git status),Bash(git diff:*),Bash(git log:*)"
             --append-system-prompt "Follow CLAUDE.md. Implement the issue's acceptance criteria with tests, keep the change minimal and in scope, run gofmt/go vet/go test before finishing."
 
+      - name: report Claude usage (D61)
+        if: ${{ !cancelled() && steps.claude.outputs.execution_file != '' }}
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          FILE: ${{ steps.claude.outputs.execution_file }}
+          NUM: ${{ github.event.issue.number }}
+          WF: agent
+          RUN: ${{ github.run_id }}
+        run: .github/scripts/usage-comment.sh
+
       # The action pushes a branch but does not open PRs. Open it deterministically, as kiu-homie-bot,
       # and turn on auto-merge (merges only after CI + homie-reviewer approval, per branch protection).
       - name: open PR + enable auto-merge
-        if: github.event_name == 'issues' && steps.claude.outputs.branch_name != ''
+        if: github.event_name == 'issues' && steps.budget.outputs.state == 'ok' && steps.claude.outputs.branch_name != ''
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           GH_REPO: ${{ github.repository }}
