@@ -44,7 +44,12 @@ func main() {
 	if p := os.Getenv("PORT"); p != "" {
 		addr = ":" + p
 	}
-	srv := &http.Server{Addr: addr, Handler: newMux(), ReadHeaderTimeout: 5 * time.Second}
+	handler := http.Handler(newMux())
+	if t := newTracerFromEnv(); t != nil {
+		go t.run(exportInterval, make(chan struct{}))
+		handler = t.middleware(handler)
+	}
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("%s %s listening on %s", appName(), version, addr)
 	log.Fatal(srv.ListenAndServe())
 }
