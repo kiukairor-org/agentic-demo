@@ -52,6 +52,12 @@ jobs:
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           [ -n "$pr" ] && echo "PR #$pr" || echo "no open PR for $BRANCH@$HEAD_SHA"
 
+      # Usage gate (D62): the reviewer still runs while the budget is PAUSED (so nothing half-merges);
+      # it skips Claude only when a real usage LIMIT was hit.
+      - id: budget
+        if: steps.pr.outputs.number != ''
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: .github/scripts/budget-state.sh
       - id: gate
         if: steps.pr.outputs.number != ''
         name: escalation gate (code, before Claude)
@@ -88,8 +94,16 @@ jobs:
           printf 'Not auto-reviewed — escalated to a human:\n%s\n' "$REASON" > body.md
           gh pr comment "$PR" --body-file body.md
 
+      - name: usage limit - reviewer waits
+        if: steps.gate.outputs.escalate == 'false' && steps.budget.outputs.state == 'limit'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          printf '⏸️ Review skipped: Claude usage limit reached (owner usage gate). Push a commit or re-run CI after the reset to review.\n<!-- homie-budget-skipped -->\n' > skip.md
+          gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file skip.md
       - id: prompt
-        if: steps.gate.outputs.escalate == 'false'
+        if: steps.gate.outputs.escalate == 'false' && steps.budget.outputs.state != 'limit'
         run: |
           {
             echo "text<<PROMPT_EOF"
@@ -99,7 +113,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - id: claude
-        if: steps.gate.outputs.escalate == 'false'
+        if: steps.gate.outputs.escalate == 'false' && steps.budget.outputs.state != 'limit'
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1.0.251
         env:
           GH_TOKEN: ${{ steps.ro.outputs.token }}   # read-only token for the gh commands below
@@ -114,6 +128,15 @@ jobs:
             --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch"
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","summary","findings"],"properties":{"verdict":{"enum":["approve","request_changes"]},"summary":{"type":"string","maxLength":3000},"findings":{"type":"array","maxItems":30,"items":{"type":"object","additionalProperties":false,"required":["severity","issue"],"properties":{"severity":{"enum":["blocker","major","minor","nit"]},"file":{"type":"string"},"line":{"type":"integer"},"issue":{"type":"string","maxLength":1500}}}}}}'
 
+      - name: report Claude usage (D61)
+        if: ${{ !cancelled() && steps.claude.outputs.execution_file != '' }}
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          FILE: ${{ steps.claude.outputs.execution_file }}
+          NUM: ${{ steps.pr.outputs.number }}
+          WF: review
+          RUN: ${{ github.run_id }}
+        run: .github/scripts/usage-comment.sh
       - id: rw
         if: steps.claude.outcome == 'success'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
