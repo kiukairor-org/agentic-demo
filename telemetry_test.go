@@ -1,143 +1,150 @@
 package main
 
 import (
-	"encoding/json"
-	"io"
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
-type fakeCollector struct {
-	*httptest.Server
-	mu     sync.Mutex
-	paths  []string
-	ctypes []string
-	bodies []string
+// testTelemetry installs in-memory trace and metric pipelines as the global providers for one test.
+func testTelemetry(t *testing.T) (*tracetest.InMemoryExporter, *sdkmetric.ManualReader) {
+	t.Helper()
+	exp := tracetest.NewInMemoryExporter()
+	reader := sdkmetric.NewManualReader()
+	prevT, prevM, prevP := otel.GetTracerProvider(), otel.GetMeterProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp)))
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTracerProvider(prevT); otel.SetMeterProvider(prevM); otel.SetTextMapPropagator(prevP) })
+	return exp, reader
 }
 
-func newFakeCollector() *fakeCollector {
-	c := &fakeCollector{}
-	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		c.mu.Lock()
-		c.paths = append(c.paths, r.URL.Path)
-		c.ctypes = append(c.ctypes, r.Header.Get("Content-Type"))
-		c.bodies = append(c.bodies, string(b))
-		c.mu.Unlock()
-	}))
-	return c
-}
-
-func serve(h http.Handler, method, path string) {
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method, path, nil))
-}
-
-func tracedMux(t *tracer) http.Handler {
-	mux := newMux()
-	mux.HandleFunc("GET /boom", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "boom"})
-	})
-	return t.middleware(mux)
-}
-
-func TestSpanExported(t *testing.T) {
-	c := newFakeCollector()
-	defer c.Close()
-	tr := newTracer(c.URL, "svc", "v1")
-	h := tracedMux(tr)
-	serve(h, "GET", "/version")
-	serve(h, "GET", "/nope")
-	tr.flush()
-
-	if len(c.bodies) != 1 || c.paths[0] != "/v1/traces" || c.ctypes[0] != "application/json" {
-		t.Fatalf("unexpected export: %v %v", c.paths, c.ctypes)
+func spanAttr(s tracetest.SpanStub, key string) attribute.Value {
+	for _, a := range s.Attributes {
+		if string(a.Key) == key {
+			return a.Value
+		}
 	}
-	var p struct {
-		ResourceSpans []struct {
-			Resource struct {
-				Attributes []otlpAttr `json:"attributes"`
-			} `json:"resource"`
-			ScopeSpans []struct {
-				Spans []otlpSpan `json:"spans"`
-			} `json:"scopeSpans"`
-		} `json:"resourceSpans"`
-	}
-	if err := json.Unmarshal([]byte(c.bodies[0]), &p); err != nil {
+	return attribute.Value{}
+}
+
+// histogramCounts returns <attr value> -> request count for one histogram metric.
+func histogramCounts(t *testing.T, r *sdkmetric.ManualReader, name, attr string) map[string]uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := r.Collect(context.Background(), &rm); err != nil {
 		t.Fatal(err)
 	}
-	res := p.ResourceSpans[0].Resource.Attributes
-	if res[0].Value["stringValue"] != "svc" || res[1].Value["stringValue"] != "v1" {
-		t.Errorf("bad resource: %+v", res)
+	got := map[string]uint64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				for _, dp := range m.Data.(metricdata.Histogram[float64]).DataPoints {
+					v, _ := dp.Attributes.Value(attribute.Key(attr))
+					got[v.Emit()] += dp.Count
+				}
+			}
+		}
 	}
-	spans := p.ResourceSpans[0].ScopeSpans[0].Spans
-	if len(spans) != 2 {
-		t.Fatalf("want 2 spans, got %d", len(spans))
+	return got
+}
+
+func TestServerSpansAndSemconvDurationMetric(t *testing.T) {
+	exp, reader := testTelemetry(t)
+	mux := newMux()
+	mux.HandleFunc("GET /fail", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "x"})
+	})
+	h := serverHandler(mux)
+	for _, p := range []string{"/version", "/fail", "/nope", "/healthz"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, p, nil))
 	}
-	s := spans[0]
-	if s.Name != "GET /version" || s.Kind != 2 || len(s.TraceID) != 32 || len(s.SpanID) != 16 || s.Status.Code != 0 {
-		t.Errorf("bad span: %+v", s)
+	byName := map[string]tracetest.SpanStub{}
+	for _, s := range exp.GetSpans() {
+		byName[s.Name] = s
+		if s.SpanKind != trace.SpanKindServer {
+			t.Fatalf("want SERVER spans: %v", s.Name)
+		}
 	}
-	a := map[string]map[string]string{}
-	for _, at := range s.Attributes {
-		a[at.Key] = at.Value
+	if len(byName) != 3 { // /healthz is not traced
+		t.Fatalf("got spans %v", byName)
 	}
-	if a["http.request.method"]["stringValue"] != "GET" || a["http.route"]["stringValue"] != "GET /version" ||
-		a["url.path"]["stringValue"] != "/version" || a["http.response.status_code"]["intValue"] != "200" {
-		t.Errorf("bad attrs: %+v", a)
+	ok, fail := byName["GET /version"], byName["GET /fail"]
+	if spanAttr(ok, "http.route").AsString() != "/version" || spanAttr(fail, "http.response.status_code").AsInt64() != 500 {
+		t.Fatalf("route/status not recorded: %v %v", ok.Attributes, fail.Attributes)
 	}
-	if spans[1].Name != "GET (unmatched)" {
-		t.Errorf("404 name = %q", spans[1].Name)
+	if fail.Status.Code != codes.Error || ok.Status.Code == codes.Error {
+		t.Fatalf("5xx must be an error, 2xx not")
 	}
-	if !strings.Contains(c.bodies[0], `"startTimeUnixNano":"`) {
-		t.Errorf("int64 times must be strings")
+	// New Relic's OpenTelemetry APM view and golden metrics read this metric (http.route = transaction name).
+	routes := histogramCounts(t, reader, "http.server.request.duration", "http.route")
+	if routes["/version"] != 1 || routes["/fail"] != 1 {
+		t.Fatalf("http.server.request.duration by route: %v", routes)
 	}
 }
 
-func TestServerErrorMarked(t *testing.T) {
-	c := newFakeCollector()
-	defer c.Close()
-	tr := newTracer(c.URL, "svc", "v1")
-	serve(tracedMux(tr), "GET", "/boom")
-	tr.flush()
-	if len(c.bodies) != 1 || !strings.Contains(c.bodies[0], `"status":{"code":2}`) {
-		t.Fatalf("expected error status, got %v", c.bodies)
+func TestOutboundCallsAreClientSpansAndMetrics(t *testing.T) {
+	exp, reader := testTelemetry(t)
+	var hdr string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hdr = r.Header.Get("traceparent") }))
+	defer srv.Close()
+	for _, propagate := range []bool{true, false} {
+		hdr = ""
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", srv.URL, nil)
+		resp, err := instrumentedClient(0, propagate).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close() // ends the client span
+		if (hdr != "") != propagate {
+			t.Fatalf("propagate=%v but traceparent=%q", propagate, hdr)
+		}
+	}
+	if n := len(exp.GetSpans()); n != 2 || exp.GetSpans()[0].SpanKind != trace.SpanKindClient {
+		t.Fatalf("want 2 CLIENT spans, got %d", n)
+	}
+	if len(histogramCounts(t, reader, "http.client.request.duration", "server.address")) == 0 {
+		t.Fatal("outbound calls must record http.client.request.duration (external services)")
 	}
 }
 
-func TestHealthzNotTraced(t *testing.T) {
-	c := newFakeCollector()
-	defer c.Close()
-	tr := newTracer(c.URL, "svc", "v1")
-	serve(tracedMux(tr), "GET", "/healthz")
-	tr.flush()
-	if len(c.bodies) != 0 {
-		t.Fatalf("healthz was exported: %v", c.bodies)
-	}
-}
-
-func TestTracingOffWithoutEndpoint(t *testing.T) {
+func TestOffWithoutEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	tr := newTracerFromEnv()
-	if tr != nil {
-		t.Fatal("tracer should be nil without endpoint")
-	}
-	rec := httptest.NewRecorder()
-	tr.middleware(newMux()).ServeHTTP(rec, httptest.NewRequest("GET", "/version", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d", rec.Code)
+	setupTelemetry(context.Background())(context.Background())
+	if _, ok := otel.GetTracerProvider().(*sdktrace.TracerProvider); ok {
+		t.Fatal("no SDK provider must be installed without an endpoint")
 	}
 }
 
-func TestFullQueueDropsWithoutBlocking(t *testing.T) {
-	tr := newTracer("http://127.0.0.1:1", "svc", "v1")
-	for i := 0; i < spanQueueSize+10; i++ {
-		tr.record(otlpSpan{})
+func TestBrowserSnippetInjectedIntoHead(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "snippet.html")
+	if err := os.WriteFile(f, []byte(`<script type="text/javascript">window.NREUM={}</script>`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if len(tr.spans) != spanQueueSize {
-		t.Fatalf("queue len = %d", len(tr.spans))
+	prev := browserAgent
+	browserAgent = loadBrowserSnippet(f)
+	t.Cleanup(func() { browserAgent = prev })
+	rec := httptest.NewRecorder()
+	servePage(rec, []byte("<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>x</title>\n</head>\n</html>"))
+	page := rec.Body.String()
+	if !strings.Contains(page, "<meta charset=\"utf-8\">\n<script type=\"text/javascript\">window.NREUM") || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("snippet must open <head>:\n%s", page)
 	}
-	tr.flush() // unreachable collector must not panic or hang
+	if loadBrowserSnippet("") != nil || string(withBrowserAgent([]byte("<head>\n"), nil)) != "<head>\n" {
+		t.Fatal("no file must mean no snippet")
+	}
 }
