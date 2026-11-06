@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -146,5 +147,37 @@ func TestBrowserSnippetInjectedIntoHead(t *testing.T) {
 	}
 	if loadBrowserSnippet("") != nil || string(withBrowserAgent([]byte("<head>\n"), nil)) != "<head>\n" {
 		t.Fatal("no file must mean no snippet")
+	}
+}
+
+func resourceServiceName(t *testing.T) string {
+	t.Helper()
+	res, err := telemetryResource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range res.Attributes() {
+		if a.Key == semconv.ServiceNameKey {
+			return a.Value.AsString()
+		}
+	}
+	return ""
+}
+
+func TestResourceServiceNameResolution(t *testing.T) {
+	t.Setenv("APP_NAME", "agentic-demo")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	if got := resourceServiceName(t); got != "agentic-demo" {
+		t.Fatalf("env unset: service.name = %q, want agentic-demo", got)
+	}
+	t.Setenv("OTEL_SERVICE_NAME", "override")
+	if got := resourceServiceName(t); got != "override" {
+		t.Fatalf("OTEL_SERVICE_NAME: service.name = %q, want override", got)
+	}
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment.name=preview,service.name=from-attrs")
+	if got := resourceServiceName(t); got != "from-attrs" {
+		t.Fatalf("OTEL_RESOURCE_ATTRIBUTES: service.name = %q, want from-attrs", got)
 	}
 }
